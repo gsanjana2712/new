@@ -1,0 +1,191 @@
+pipeline {
+    agent any
+    triggers {
+        githubPush()
+    }
+    parameters {
+        choice(name: 'ENV_VAR', choices: 'choose\ndev\nprod', description: 'Select Environment')
+        // string(name: 'ENVIRONMENT', defaultValue: 'dev', description: 'ENVIRONMENT')
+    }
+    environment {
+        ENV_VAR = "${params.ENV_VAR}"
+        DOCKER_OPTS = "-Dpermissive-script-security.enabled=true"
+        registryCredential = 'sanjanagupta-dockerhub'
+        prodPublishPort = "9292"
+        devPublishPort = "8282"
+        dockerImage = ''
+    }
+    tools {
+        maven 'Maven'
+    }
+    stages {
+        stage('Fetching Environment') {
+            steps {
+                script { 
+                    if (env.ENV_VAR == 'choose') {
+                        env.ENVIRONMENT = input(
+                            id: 'ENVIRONMENT',
+                            message: 'Choose ENVIRONMENT:',
+                            parameters: [
+                                choice(name: 'ENVIRONMENT', choices: 'dev\nprod', description: 'Select Environment')
+                            ]
+                        )
+                    } else {
+                        env.ENVIRONMENT = "${ENV_VAR}"
+                    }  
+                    echo "ENVIRONMENT: ${env.ENVIRONMENT}"
+                    env.dockerImageName = "sanjanagupta2712/testapp-${env.ENVIRONMENT}"
+                }
+            }
+        }
+        stage('GetCode') {
+            steps {
+                checkout scmGit(branches: [[name: "*/${env.ENVIRONMENT}"]], extensions: [], userRemoteConfigs: [[credentialsId: 'gsanjana2712-github', url: 'https://github.com/gsanjana2712/testapp.git']])
+            }
+        }
+        stage('Build') {
+            steps {
+                sh 'mvn clean install -f pom.xml'
+            }
+
+        }
+        stage('Test') {
+            steps {
+                sh 'mvn test'
+
+            }
+            post {
+                always {
+                    junit allowEmptyResults: true, testResults: 'pom.xml'
+                }
+            }
+        }
+        stage('Junit Test Results') {
+            steps {
+                junit '*/**/*.xml'
+            }
+        }
+
+        stage('SonarQube analysis') {
+
+            steps {
+                withSonarQubeEnv('Sonarqube') {
+                    sh "mvn org.sonarsource.scanner.maven:sonar-maven-plugin:3.7.0.1746:sonar"
+                }
+            }
+        }
+        stage('Server') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'sanjanagupta-jfrog', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+                    rtServer(
+                        id: "Artifactory",
+                        url: 'http://localhost:8082/artifactory',
+                        username: "${USERNAME}",
+                        password: "${PASSWORD}",
+                        bypassProxy: true,
+                        timeout: 300
+                    )
+                }
+            }
+        }
+        stage('Upload') {
+            steps {
+                rtUpload(
+                    serverId: "Artifactory",
+                    spec: '''{
+                    "files": [{
+                        "pattern": "*.war",
+                        "target": "'''+"testapp-${env.ENVIRONMENT}"+'''"
+                    }]
+                }
+                ''',
+            )
+        }
+    }
+    stage('Publish build info') {
+        steps {
+            rtPublishBuildInfo(
+                serverId: "Artifactory"
+            )
+        }
+    }
+    stage('Releasing Old Container') {
+        steps{
+            script {
+                def container_id = sh(script: "docker ps -a -q --filter ancestor=${dockerImageName}", returnStdout: true).trim()
+                echo "Container id ${container_id}"
+                sh """
+                    if [ -n "$container_id" ]; then
+                        docker stop ${container_id}
+                        docker rm -f ${container_id}
+                    fi
+                """
+            }
+        }
+    }
+    stage('Building Docker Image') {
+      steps{
+        script {
+            dockerImage = docker.build dockerImageName
+        }
+      }
+    }
+    stage('Push Docker Image to Hub') {
+      steps{
+        script {
+            docker.withRegistry( '', registryCredential) {
+                dockerImage.push('latest')
+            }
+        }
+      }
+    }
+    stage('Pull Docker Image to Hub') {
+      steps{
+        script {
+            docker.withRegistry( '', registryCredential) {
+                docker.image(dockerImageName).pull()
+            }
+        }
+      }
+    }
+    stage('Deploy Docker Image') {
+        steps{
+            script {
+                if (env.ENVIRONMENT == 'dev') {
+                    env.publishPort = "${devPublishPort}"
+                } else {
+                    env.publishPort = "${prodPublishPort}"
+                }
+                def container_id = sh(script: "docker ps -a -q --filter publish=${publishPort}", returnStdout: true).trim()
+                echo "Container id ${container_id}"
+                sh """
+                    if [ -n "$container_id" ]; then
+                        docker stop ${container_id}
+                        docker rm -f ${container_id}
+                    fi
+                """
+                docker.image(dockerImageName).run('-p '+publishPort+':8080')
+                sh """
+                    sudo firewall-cmd --zone=public --add-port=${publishPort}/tcp --permanent
+                    sudo firewall-cmd --reload
+                """
+            }
+        }
+      }
+    }
+    post {
+        always {
+            script {
+                def jobName = currentBuild.fullProjectName
+                def buildNumber = currentBuild.number
+                
+                emailext (
+                    body: "Build #${buildNumber} of ${jobName} completed. Check the attached logs for details.",
+                    to: 'sanjana.gupta@nagarro.com',
+                    subject: "Build Completed - ${jobName} - #${buildNumber}",
+                    attachLog: true
+                )
+            }
+        }
+    }
+}
